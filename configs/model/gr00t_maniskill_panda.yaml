@@ -1,0 +1,31 @@
+model_type: gr00t
+model_path: /ufs/models/gr00t_1.5/
+num_action_chunks: 5
+action_dim: 7
+num_steps: 4
+add_value_head: false
+predict_micro_batch_size: 64
+policy_setup: panda-ee-dpose
+
+gr00t:
+  embodiment_tag: maniskill_panda
+  obs_converter_type: maniskill_panda
+  denoising_steps: 4
+  precision: bf16
+  tune_visual: false
+  tune_llm: false
+  rl_head_config:
+    joint_logprob: true
+    noise_method: flow_sde
+    ignore_last: false
+    safe_get_logprob: false
+    noise_anneal: false
+    noise_params: [0.7, 0.3, 400]
+    noise_level: 0.5
+    add_value_head: false
+    chunk_critic_input: false
+    detach_critic_input: true
+    disable_dropout: true
+    use_vlm_value: false
+    value_vlm_mode: mean_token
+    padding_value: 570

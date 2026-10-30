@@ -1,0 +1,96 @@
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 6-7
+    env: 0-5
+    rollout: 0-5
+runner:
+  task_type: embodied
+  logger:
+    log_path: ./results
+    project_name: joyrlinf
+    experiment_name: libero_grpo_pi05
+    logger_backends:
+    - tensorboard
+  max_steps: 6
+  val_check_interval: -1
+  save_interval: 25
+  resume_dir: null
+algorithm:
+  pipeline_mode: async
+  comm_mode: v1
+  group_size: 8
+  rollout_epoch: 1
+  update_epoch: 1
+  adv_type: grpo
+  loss_type: actor
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  filter_rewards: true
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 5.0
+memory:
+  pytorch_fraction: 0.0
+  safety_margin_mib: 8192
+  critical_margin_mib: 2048
+  gc_threshold: 0.8
+  max_split_size_mb: 128
+  expandable_segments: true
+env:
+  train:
+    env_type: libero
+    task_suite_name: libero_90
+    total_num_envs: 192
+    group_size: 8
+    auto_reset: true
+    use_fixed_reset_state_ids: false
+    use_ordered_reset_state_ids: false
+    max_episode_steps: 512
+    max_steps_per_rollout_epoch: 75
+    use_rel_reward: true
+    reward_coef: 5.0
+    reset_gripper_open: true
+    seed: 0
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+actor:
+  enable_offload: false
+  micro_batch_size: 16
+  model:
+    model_path: /ufs/xxl/RLinf-Pi05-LIBERO-SFT
+    model_type: openpi
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 4
+    add_value_head: false
+    predict_micro_batch_size: 16
+    openpi:
+      config_name: pi05_libero
+      num_images_in_input: 2
+      noise_method: flow_noise
+      action_horizon: 8
+      noise_params:
+      - 0.16
+      - 0.12
+      - 200
+      joint_logprob: true
+      train_expert_only: true
+    policy_setup: libero
+  optim:
+    lr: 7.91e-06
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+  fsdp_config:
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+  gradient_accumulation_steps: 6

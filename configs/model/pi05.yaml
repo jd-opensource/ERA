@@ -1,0 +1,15 @@
+model_type: openpi
+model_path: /ufs_500T/model/colm_paper_model_test/RLinf-Pi0-ManiSkill-25Main-SFT/
+precision: null
+num_action_chunks: 10
+action_dim: 7
+num_steps: 4
+add_value_head: False
+openpi:
+  config_name: pi05_maniskill
+  num_images_in_input: 1
+  noise_method: flow_noise
+  action_horizon: 8
+  noise_params: [0.16, 0.12, 200]
+  joint_logprob: True
+policy_setup: widowx_bridge

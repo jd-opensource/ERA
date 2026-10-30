@@ -1,0 +1,173 @@
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 6-7
+    env: 0-5
+    rollout: 0-5
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: ./results
+    project_name: joyrlinf
+    experiment_name: maniskill_grpo_pi05_async
+    logger_backends: [tensorboard]
+  max_steps: 100
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  # resume_dir: ./results/maniskill_grpo_pi05_async/runs/<run_id>/checkpoints/global_step_4
+
+algorithm:
+  pipeline_mode: async
+  comm_mode: v2              # v1: paired P2P, v2: all-to-all multi-to-multi
+  group_size: 8
+  rollout_epoch: 1
+  update_epoch: 1
+  adv_type: grpo
+  loss_type: actor
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  filter_rewards: True
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+
+# GPU memory budget for co-located env+rollout ranks (H800 143GB).
+#
+# Measured baselines (H800 143GB, 4 rollout GPUs):
+#   384 envs/GPU: PhysX 62GB, pt_rsv 41GB (mbs=64), free 40GB  ← MEASURED
+#   512 envs/GPU: PhysX ~81GB (est +148M/env), pt_rsv 41GB, free ~21GB
+#   640 envs/GPU: PhysX ~100GB, free ~2GB → NOT SAFE
+#
+# PhysX: ~148 MiB per additional env (linear, measured 64→384).
+# PyTorch reserved: ~41GB (mbs=64), ~48GB (mbs=128), ~55GB (mbs=192).
+# Practical max: ~512 envs/GPU with mbs=64, ~448 envs/GPU with mbs=128.
+memory:
+  # 0 = uncapped (recommended for large env).  The gc_threshold still
+  # reclaims stale blocks without nuking cuBLAS workspace.
+  pytorch_fraction: 0.0
+  # Warn when free VRAM drops below 8GB.
+  safety_margin_mib: 8192
+  # Error when free VRAM drops below 2GB.
+  critical_margin_mib: 2048
+  gc_threshold: 0.8
+  max_split_size_mb: 128
+  expandable_segments: true
+  # If true, rollout empty_cache()s on a background thread after each predict
+  # to hand its idle reserve to the colocated actor (needs expandable_segments).
+  release_after_predict: false
+  # If true, actor empty_cache()s its idle reserve on a background thread
+  # whenever the phase gate yields the GPU back to the paired rollout's
+  # predict (needs expandable_segments; release overlaps the predict).
+  actor_release_before_yield: false
+
+env:
+  train:
+    env_type: maniskill
+    total_num_envs: 384
+    group_size: 8
+    auto_reset: False
+    use_fixed_reset_state_ids: False
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 80
+    use_rel_reward: True
+    seed: 0
+    init_params:
+      id: PutOnPlateInScene25Main-v3
+      obs_mode: rgb+segmentation
+      control_mode: arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 500
+        control_freq: 5
+        # PhysX GPU buffer capacities (pre-allocated, not limits).
+        gpu_memory_config:
+          found_lost_pairs_capacity: 268435456
+          found_lost_aggregate_pairs_capacity: 8192
+          total_aggregate_pairs_capacity: 8192
+          max_rigid_contact_count: 4194304
+          max_rigid_patch_count: 2097152
+          heap_capacity: 536870912
+          temp_buffer_capacity: 134217728
+          collision_stack_size: 33554432
+      sensor_configs:
+        shader_pack: default
+      render_mode: all
+      obj_set: train
+      use_multiple_plates: False
+
+  eval:
+    total_num_envs: 128
+    group_size: 8
+    auto_reset: False
+    use_fixed_reset_state_ids: True
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 80
+    use_rel_reward: True
+    seed: 0
+    init_params:
+      id: PutOnPlateInScene25Main-v3
+      obs_mode: rgb+segmentation
+      control_mode: arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 500
+        control_freq: 5
+        gpu_memory_config:
+          found_lost_pairs_capacity: 268435456
+          found_lost_aggregate_pairs_capacity: 8192
+          total_aggregate_pairs_capacity: 8192
+          max_rigid_contact_count: 4194304
+          max_rigid_patch_count: 2097152
+          heap_capacity: 536870912
+          temp_buffer_capacity: 134217728
+          collision_stack_size: 33554432
+      sensor_configs:
+        shader_pack: default
+      render_mode: all
+      obj_set: test
+      use_multiple_plates: False
+
+actor:
+  enable_offload: False
+  micro_batch_size: 64
+  # per-actor batch = micro_batch_size × gradient_accumulation_steps = 192
+  # effective global batch = per-actor × n_actor = 384
+  gradient_accumulation_steps: 3
+  model:
+    model_path: /ufs_500T/model/colm_paper_model_test/RLinf-Pi05-ManiSkill-25Main-SFT/
+    model_type: openpi
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 4
+    add_value_head: False
+    predict_micro_batch_size: 64
+    openpi:
+      config_name: pi05_maniskill
+      num_images_in_input: 1
+      noise_method: flow_noise
+      action_horizon: 8
+      noise_params: [0.16, 0.12, 200]
+      joint_logprob: True
+      train_expert_only: True
+      # Gemma attention kernel: eager | gqa_eager. gqa_eager = same eager
+      # math against unexpanded K/V (bit-exact, no repeat_kv copies saved
+      # for backward): large activation cut in actor training.
+      attn_implementation: eager
+    policy_setup: widowx_bridge
+  optim:
+    lr: 7.91e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+  fsdp_config:
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null

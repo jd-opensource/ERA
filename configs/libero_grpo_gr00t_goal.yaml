@@ -1,0 +1,110 @@
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 6-7
+    env: 0-5
+    rollout: 0-5
+runner:
+  task_type: embodied
+  logger:
+    log_path: ./results
+    project_name: joyrlinf
+    experiment_name: libero_grpo_gr00t_goal
+    logger_backends:
+    - tensorboard
+  max_steps: 3
+  val_check_interval: -1
+  save_interval: 25
+  resume_dir: null
+algorithm:
+  pipeline_mode: async
+  comm_mode: v1
+  group_size: 8
+  rollout_epoch: 1
+  update_epoch: 1
+  adv_type: grpo
+  loss_type: actor
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  filter_rewards: true
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 5.0
+memory:
+  pytorch_fraction: 0.0
+  safety_margin_mib: 8192
+  critical_margin_mib: 2048
+  gc_threshold: 0.8
+  max_split_size_mb: 128
+  expandable_segments: true
+env:
+  train:
+    env_type: libero
+    task_suite_name: libero_goal
+    total_num_envs: 192
+    group_size: 8
+    auto_reset: true
+    use_fixed_reset_state_ids: false
+    use_ordered_reset_state_ids: false
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 75
+    use_rel_reward: true
+    reward_coef: 5.0
+    reset_gripper_open: true
+    seed: 0
+    init_params:
+      camera_heights: 256
+      camera_widths: 256
+actor:
+  enable_offload: false
+  micro_batch_size: 16
+  model:
+    model_path: /ufs_500T/model/RLinf-Gr00t-SFT-Goal
+    model_type: gr00t
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 4
+    add_value_head: false
+    predict_micro_batch_size: 16
+    policy_setup: libero
+    gr00t:
+      embodiment_tag: libero_franka
+      obs_converter_type: libero
+      denoising_steps: 4
+      precision: bf16
+      tune_visual: false
+      tune_llm: false
+      rl_head_config:
+        joint_logprob: true
+        noise_method: flow_sde
+        ignore_last: false
+        safe_get_logprob: false
+        noise_anneal: false
+        noise_params:
+        - 0.7
+        - 0.3
+        - 400
+        noise_level: 0.5
+        add_value_head: false
+        chunk_critic_input: false
+        detach_critic_input: true
+        disable_dropout: true
+        use_vlm_value: false
+        value_vlm_mode: mean_token
+        padding_value: 570
+  optim:
+    lr: 7.91e-06
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+  fsdp_config:
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+  gradient_accumulation_steps: 6

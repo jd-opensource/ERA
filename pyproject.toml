@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joyrlinf"
+version = "0.1.0"
+description = "Embodied RL post-training framework with DirectPipe zero-copy communication"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "mani_skill",
+    "gymnasium",
+    "numpy",
+    "tensorboard",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+openpi = ["openpi"]
+wandb = ["wandb"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["joyrlinf*"]

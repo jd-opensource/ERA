@@ -1,0 +1,294 @@
+# ManiSkill Pi0.5 — colocated async MPS + memory opts (S1 + Phase2 + gate + SharedHost)
+#
+# Enables:
+#   - train_expert_only + reuse_rollout_prefix_kv + expert_only_actor
+#   - rollout_buffer_d2h=per_chunk (PrefixKvHostPool, overlap with env.chunk_step)
+#   - prefix_kv_ipc=host_shm (double-buffer POSIX shm; skip Gloo clone of KV)
+#   - gpu_phase_gate=per_chunk (predict ⊥ train; only cached chunk_step ‖ train)
+#   - microbatch_prefetch=false (shared-GPU VRAM)
+#
+# Not yet migrated (leave off / ignore until Phase3–5):
+#   - enable_gradient_checkpointing / expert_layer GC
+#   - CUDA IPC SharedGPUPipe
+#
+# Launch (8 physical GPUs → 8 EnvRollout + 8 Actor MPS clients):
+#   cd /ufs_500T/jh/code/joyrlinf-dev/colocated_async/joyrlinf
+#   source switch_env openpi   # or: source /opt/venv/openpi/bin/activate
+#   export PYTHONPATH=.
+#   bash run_pi05_maniskill_async_mps_mem.sh
+#   # or:
+#   torchrun --nproc_per_node=8 scripts/train_async_mps.py \
+#     --config configs/experiments/maniskill_grpo_pi05_async_mps_mem.yaml
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    # Logical ranks after train_async_mps expands each torchrun worker:
+    # EnvRollout 0-7 and Actor 8-15, paired on the same physical GPU.
+    actor: 8-15
+    env: 0-7
+    rollout: 0-7
+
+mps:
+  manage_daemon: true
+  # Both clients keep 100% thread ceiling so idle Env SM can serve Actor.
+  env_rollout_active_thread_percentage: 100
+  actor_active_thread_percentage: 100
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: ./results
+    project_name: joyrlinf
+    experiment_name: maniskill_grpo_pi05_async_mps_mem
+    logger_backends: [tensorboard]
+  max_epochs: 200
+  # First GPU smoke: keep small (e.g. 5–10). Raise after OOM-free.
+  max_steps: 500
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+
+# Torch Chrome-trace profiler (wired into embodied_runner_async_mps).
+# Off by default. For a smoke profile on first EnvRollout + source Actor:
+#   enable: true
+#   role_steps: {rollout: [3], actor: [2]}  # same wall-clock window (async offset)
+#   ranks: [0, 8]   # rollout rank 0 + actor rank 8 (same physical GPU 0 pair)
+# Traces: {run_output_dir}/profiler/<rollout|actor>/step-*_tag-mps_*.trace.json
+# Tags include: mps_rollout, mps_rollout_send, mps_weight_load,
+#   mps_actor_recv, mps_actor_adv, mps_actor_train,
+#   mps_weight_extract, mps_weight_broadcast
+# View: chrome://tracing or https://ui.perfetto.dev/
+profiler:
+  enable: false
+  tool: torch
+  steps: [3]
+  # Same wall-clock window on a GPU pair: actor step N trains the batch from
+  # rollout epoch N and wall-overlaps rollout step N+1, so trace actor one
+  # step earlier than rollout. Roles not listed here fall back to `steps`.
+  role_steps:
+    rollout: [3]
+    actor: [2]
+  profile_continuous_steps: false
+  save_path: null
+  all_ranks: false
+  ranks: [0, 8]
+  roles: [rollout, actor]
+  tool_config:
+    torch:
+      contents: [cuda, cpu, memory]
+      # discrete=true → one trace file per tagged range (mps_rollout / mps_actor_train / …)
+      discrete: false
+      compress: false
+
+# EnvRollout and Actor are persistent MPS clients on every GPU.
+# Rollout N+1 overlaps Actor training N; weights may be one step stale.
+
+algorithm:
+  pipeline_mode: async
+  # Same-GPU NCCL between two processes is unsupported; MPS runner uses
+  # paired Gloo batch transfer. Actor FSDP stays 8-GPU NCCL.
+  comm_mode: mps
+  normalize_advantages: True
+  group_size: 8
+  reward_coef: 1.0
+  rollout_epoch: 1
+  update_epoch: 1
+  adv_type: grpo
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0.005
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+  filter_rewards: True
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+
+memory:
+  # Shared GPU: Env + Actor resident. If OOM, try 0.45–0.55 then lower envs / mbs.
+  # Per-step peaks (process-local under MPS) are logged + TensorBoard memory/*:
+  #   rollout_pt_peak_alloc_mib, actor_pt_peak_alloc_mib, pt_peak_alloc_sum_mib, free_mib
+  pytorch_fraction: 0.0
+  env_reserved_mib: 0
+  safety_margin_mib: 8192
+  critical_margin_mib: 2048
+  gc_threshold: 0.8
+  expandable_segments: true
+  # Rollout returns predict's idle reserve (transient attention/MLP peak
+  # minus steady alloc) to the driver after every predict so the colocated
+  # actor can use it during its microbatch window. Runs on a background
+  # thread — the phase-gate grant is not delayed. Cheap with
+  # expandable_segments (page unmap/remap, no cuBLAS workspace loss).
+  release_after_predict: true
+  # Mirror image of release_after_predict: on every yield the actor signals
+  # a background thread to empty_cache its idle reserve (freed microbatch
+  # activations, tens of GiB). The release overlaps the paired rollout's
+  # predict instead of delaying the phase-gate grant.
+  actor_release_before_yield: true
+
+env:
+  train:
+    env_type: maniskill
+    # 2048 envs / 8 GPUs = 256 envs per GPU. Needs host /dev/shm >= 1.2TiB
+    # (KV double buffer ~70GiB x 2 x 8 pairs). OOM → back to 1024.
+    total_num_envs: 2048
+    group_size: 8
+    auto_reset: False
+    use_fixed_reset_state_ids: False
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 80
+    render_obs_only_at_chunk_end: True
+    use_rel_reward: True
+    seed: 0
+    init_params:
+      id: PutOnPlateInScene25Main-v3
+      obs_mode: rgb+segmentation
+      control_mode: arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 500
+        control_freq: 5
+        gpu_memory_config:
+          found_lost_pairs_capacity: 268435456
+          found_lost_aggregate_pairs_capacity: 8192
+          total_aggregate_pairs_capacity: 8192
+          max_rigid_contact_count: 4194304
+          max_rigid_patch_count: 2097152
+          heap_capacity: 536870912
+          temp_buffer_capacity: 134217728
+          collision_stack_size: 33554432
+      sensor_configs:
+        shader_pack: default
+      render_mode: all
+      obj_set: train
+      use_multiple_plates: False
+
+  eval:
+    total_num_envs: 256
+    group_size: 8
+    auto_reset: False
+    use_fixed_reset_state_ids: True
+    max_episode_steps: 80
+    max_steps_per_rollout_epoch: 80
+    use_rel_reward: True
+    seed: 0
+    init_params:
+      id: PutOnPlateInScene25Main-v3
+      obs_mode: rgb+segmentation
+      control_mode: arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos
+      sim_backend: gpu
+      sim_config:
+        sim_freq: 500
+        control_freq: 5
+        gpu_memory_config:
+          found_lost_pairs_capacity: 268435456
+          found_lost_aggregate_pairs_capacity: 8192
+          total_aggregate_pairs_capacity: 8192
+          max_rigid_contact_count: 4194304
+          max_rigid_patch_count: 2097152
+          heap_capacity: 536870912
+          temp_buffer_capacity: 134217728
+          collision_stack_size: 33554432
+      sensor_configs:
+        shader_pack: default
+      render_mode: all
+      obj_set: test
+      use_multiple_plates: False
+
+actor:
+  # Keep model weights on GPU (required for colocated async). Only park Adam
+  # moments on CPU and H2D around optimizer.step() — saves ~2x trainable params.
+  enable_offload: False
+  enable_optimizer_offload: True
+  # per_actor = mbs * ga = 64 * 64 = 4096 (= 2048 envs x 16 chunk rows / 8).
+  # mbs 64 halves the actor's transient activation peak vs 128 (fits
+  # alongside rollout predict + PhysX at 256 env/GPU).
+  micro_batch_size: 64
+  gradient_accumulation_steps: 64
+  seed: 0
+  model:
+    model_path: /ufs_500T/model/colm_paper_model_test/RLinf-Pi05-ManiSkill-25Main-SFT/
+    model_type: openpi
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 4
+    add_value_head: False
+    # Rollout predict micro-batch. OOM during predict → lower (16 / 8).
+    predict_micro_batch_size: 128
+    # Phase3 not migrated yet — keep false.
+    enable_gradient_checkpointing: false
+    openpi:
+      config_name: pi05_maniskill
+      num_images_in_input: 1
+      noise_method: flow_noise
+      action_horizon: 8
+      # Batch GPU preprocess (resize/norm/pack) + episode prompt token cache.
+      use_gpu_input_transform: true
+      # Batch unnormalize + slice on GPU at predict exit (CUDA actions to env).
+      use_gpu_output_transform: true
+      cache_tokenized_prompt: true
+      noise_params: [0.16, 0.12, 200]
+      joint_logprob: True
+      train_expert_only: True
+      # gqa_eager: eager math against unexpanded K/V (bit-exact vs eager,
+      # no repeat_kv copies saved for backward). Drops the ~37GiB of
+      # expanded prefix K/V per 64-sample training microbatch. Fall back
+      # with: eager.
+      attn_implementation: gqa_eager
+
+      # --- S1: expert-only training stack (REQUIRED together) ---
+      # Actor reuses rollout prefix KV (skip VLM prefix recompute).
+      reuse_rollout_prefix_kv: true
+      # Physically strip VLM from the actor process only; rollout keeps full model.
+      # Requires reuse_rollout_prefix_kv. Weight broadcast stays trainable-only.
+      expert_only_actor: true
+
+      # --- Phase2: per-chunk KV D2H + host pool ---
+      # Async D2H of prefix_kv(+pad) each chunk, overlapped with env.chunk_step.
+      rollout_buffer_d2h: per_chunk
+
+      # --- Predict ⊥ train (same-GPU MPS peak VRAM) ---
+      # Only cached env.chunk_step may overlap actor training; model.predict
+      # and train microbatches are mutually exclusive via a dedicated Gloo gate.
+      gpu_phase_gate: per_chunk
+      # Allow one predict between microbatches (env overlaps train).
+      # Use "training" for stronger isolation (hold mutex for entire run_training).
+      phase_gate_granularity: microbatch
+
+      # --- Phase4/5 knobs (transfer path partially natural via mb slice) ---
+      prefix_kv_transfer: microbatch
+      # Shared-host double buffer for prefix_kv (skip Gloo clone of ~38GiB/pair).
+      # Requires reuse_rollout_prefix_kv + rollout_buffer_d2h=per_chunk.
+      # D2H goes through one-row pinned staging then H2H into pageable shm so
+      # async D2H can overlap env.chunk_step.
+      prefix_kv_ipc: host_shm
+      # Keep false on colocated async (extra ~1 mbs input VRAM if true).
+      microbatch_prefetch: false
+
+    policy_setup: widowx_bridge
+  optim:
+    lr: 7.91e-6
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    # Prefer true before enabling Phase3 GC later.
+    use_orig_params: true
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
